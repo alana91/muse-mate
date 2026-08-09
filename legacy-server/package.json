@@ -1,0 +1,12 @@
+{
+  "name": "musemate-legacy-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MuseMate v1 realtime docent server (the system to evolve).",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

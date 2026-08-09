@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<title>MuseMate v1 데모 (레거시)</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 18px; }
+  .note { background: #fff8e1; border: 1px solid #e0c060; padding: 8px 12px; font-size: 13px; border-radius: 6px; }
+  #log { border: 1px solid #ccc; border-radius: 6px; padding: 12px; height: 320px; overflow-y: auto; font-size: 13px; margin: 16px 0; }
+  #log div { margin-bottom: 6px; }
+  .t { color: #888; font-variant-numeric: tabular-nums; margin-right: 8px; }
+  .sys { color: #888; }
+  .agent { color: #0a5; }
+  .err { color: #c33; }
+  form { display: flex; gap: 8px; }
+  input[type=text] { flex: 1; padding: 8px; }
+  button { padding: 8px 14px; }
+</style>
+</head>
+<body>
+<h1>MuseMate v1 데모 — 레거시 클라이언트</h1>
+<p class="note">
+  이 페이지는 <strong>현재(v1) 시스템의 동작을 보여주는 데모</strong>입니다. 지원자 구현물이 아니며,
+  기존 배포 클라이언트가 이렇게 동작한다는 참고용입니다. 접속 후 인사말이 나올 때까지의
+  침묵 시간을 타임스탬프로 확인해 보세요.<br />
+  <em>This page demos the current (v1) system — it is not your deliverable. Watch the
+  timestamps to feel the silence between connecting and the greeting.</em>
+</p>
+<p>
+  전시:
+  <select id="exhibit">
+    <option value="moon-jar">달항아리 (moon-jar)</option>
+    <option value="gold-crown">금관 (gold-crown)</option>
+  </select>
+  <button id="connect">접속</button>
+</p>
+<div id="log"></div>
+<form id="chat">
+  <input type="text" id="msg" placeholder="도슨트에게 질문하기…" disabled />
+  <button type="submit" disabled id="sendBtn">보내기</button>
+</form>
+<script>
+  const log = document.getElementById('log');
+  const msg = document.getElementById('msg');
+  const sendBtn = document.getElementById('sendBtn');
+  let ws = null;
+  let t0 = 0;
+
+  function line(cls, text) {
+    const el = document.createElement('div');
+    const t = document.createElement('span');
+    t.className = 't';
+    t.textContent = t0 ? `+${((performance.now() - t0) / 1000).toFixed(2)}s` : '--';
+    const body = document.createElement('span');
+    body.className = cls;
+    body.textContent = text;
+    el.append(t, body);
+    log.appendChild(el);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function play(b64) {
+    new Audio('data:audio/wav;base64,' + b64).play().catch(() => {});
+  }
+
+  document.getElementById('connect').onclick = () => {
+    if (ws) ws.close();
+    log.innerHTML = '';
+    t0 = performance.now();
+    const exhibit = document.getElementById('exhibit').value;
+    ws = new WebSocket(`ws://${location.host}/ws/chat?exhibit_id=${exhibit}`);
+    line('sys', '연결 시도…');
+    ws.onopen = () => line('sys', 'WS 연결됨 — 인사말을 기다리는 중 (침묵)');
+    ws.onmessage = (e) => {
+      const f = JSON.parse(e.data);
+      if (f.type === 'greeting') {
+        line('agent', `[인사말] ${f.text}`);
+        play(f.audio_b64);
+        msg.disabled = sendBtn.disabled = false;
+        msg.focus();
+      } else if (f.type === 'agent_message') {
+        line('agent', f.text);
+        play(f.audio_b64);
+      } else if (f.type === 'error') {
+        line('err', f.message);
+      }
+    };
+    ws.onclose = () => { line('sys', '연결 종료'); msg.disabled = sendBtn.disabled = true; };
+  };
+
+  document.getElementById('chat').onsubmit = (e) => {
+    e.preventDefault();
+    if (!ws || !msg.value.trim()) return;
+    line('sys', `나: ${msg.value}`);
+    ws.send(JSON.stringify({ type: 'user_message', text: msg.value }));
+    msg.value = '';
+  };
+</script>
+</body>
+</html>

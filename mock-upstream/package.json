@@ -1,0 +1,9 @@
+{
+  "name": "musemate-mock-upstream",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fake content DB + LLM + TTS for the MuseMate take-home. Do not modify.",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
