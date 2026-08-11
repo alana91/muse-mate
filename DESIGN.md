@@ -186,3 +186,36 @@
 This keeps Compose runnable throughout, secures protected routes before they
 grow, completes the independently testable greeting core before realtime chat,
 and leaves the frontend until the required backend behavior exists.
+
+## Delivery notes
+
+### Implemented
+
+- Compose starts the unchanged v1 service and a separate v2 Node service.
+- v2 issues signed, expiring tickets and validates them for HTTP and before a
+  WebSocket connection is accepted.
+- The greeting API validates exhibit/language, returns structured errors, and
+  uses an in-memory TTL/LRU cache plus same-key request coalescing.
+- The v2 WebSocket binds exhibit and language at session creation, accepts
+  typed visitor messages, and returns typed answer or error frames.
+
+### Deferred in the time box
+
+- **Browser demo:** the page at port 3000 remains a placeholder. The backend
+  was prioritized first because tickets, caching, coalescing, and the realtime
+  protocol are the core required behavior.
+- **Sentence-level TTS pipeline:** designed above but not implemented; the
+  current WebSocket waits for the complete LLM response before generating its
+  audio.
+- **Redis, multi-instance coordination, reconnection, and persistent session
+  state:** these are production scale-out work rather than a single-instance
+  challenge prerequisite.
+- **Automated test suite:** ticket, greeting, cache, and coalescing behavior
+  were checked against the running Compose services and upstream statistics.
+  The final WebSocket path still needs an end-to-end smoke test.
+
+### AI assistance
+
+An AI coding assistant was used to inspect the existing implementation,
+discuss the design, implement changes, and run the completed backend checks.
+The trade-offs and final repository changes were reviewed during development.
