@@ -1,6 +1,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { WebSocket, WebSocketServer } = require('ws');
 const { getBearerToken, issueTicket, verifyTicket } = require('./auth');
 const { GreetingCache, greetingCacheKey } = require('./greeting-cache');
 const { SingleFlight } = require('./single-flight');
@@ -13,6 +14,7 @@ const TICKET_SECRET = process.env.TICKET_SECRET;
 const TICKET_TTL_SECONDS = Number(process.env.TICKET_TTL_SECONDS || 1800);
 const GREETING_CACHE_TTL_SECONDS = Number(process.env.GREETING_CACHE_TTL_SECONDS || 86400);
 const GREETING_CACHE_MAX_ENTRIES = Number(process.env.GREETING_CACHE_MAX_ENTRIES || 100);
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || `http://localhost:${PORT}`;
 const indexHtml = fs.readFileSync(path.join(__dirname, 'index.html'));
 
 if (!TICKET_SECRET) throw new Error('TICKET_SECRET is required');
@@ -38,6 +40,16 @@ const greetingCache = new GreetingCache({
   maxEntries: GREETING_CACHE_MAX_ENTRIES
 });
 const greetingFlights = new SingleFlight();
+
+class GreetingRequestError extends Error {
+  constructor(status, code, message, details) {
+    super(message);
+    this.name = 'GreetingRequestError';
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
 
 function json(res, status, body, headers = {}) {
   const payload = Buffer.from(JSON.stringify(body));
@@ -127,6 +139,143 @@ function sendGreeting(res, { exhibitId, lang, voice, text, wav }) {
   }, { 'cache-control': 'no-store' });
 }
 
+function sendSocketFrame(ws, frame) {
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(frame));
+}
+
+function sendSocketError(ws, code, message, { retryable = false, details, turnId } = {}) {
+  const frame = { type: 'error', code, message, retryable };
+  if (details) frame.details = details;
+  if (turnId !== undefined) frame.turn_id = turnId;
+  sendSocketFrame(ws, frame);
+}
+
+function closeSocketWithError(ws, code, message, options = {}, closeCode = 1008) {
+  sendSocketError(ws, code, message, options);
+  if (ws.readyState === WebSocket.OPEN) ws.close(closeCode);
+}
+
+async function initializeRealtimeSession(ws, { claims, exhibitId, lang }) {
+  if (!exhibitId) return closeSocketWithError(ws, 'EXHIBIT_ID_REQUIRED', 'exhibit_id is required.');
+  if (!lang) return closeSocketWithError(ws, 'LANG_REQUIRED', 'lang is required.');
+
+  let exhibit;
+  try {
+    exhibit = await upstream.getExhibit(exhibitId);
+  } catch (error) {
+    if (error instanceof UpstreamError) {
+      return closeSocketWithError(ws, error.code, error.message, { retryable: error.retryable }, 1011);
+    }
+    throw error;
+  }
+
+  if (!exhibit) return closeSocketWithError(ws, 'EXHIBIT_NOT_FOUND', 'The exhibit was not found.');
+  if (!Array.isArray(exhibit.supported_langs) || !exhibit.supported_langs.includes(lang)) {
+    return closeSocketWithError(
+      ws,
+      'UNSUPPORTED_LANGUAGE',
+      'This language is not supported for the exhibit.',
+      { details: { supported_langs: exhibit.supported_langs || [] } }
+    );
+  }
+
+  const introText = exhibit.intro_text?.[lang];
+  const voice = exhibit.voices?.[0];
+  if (typeof introText !== 'string' || !voice) {
+    return closeSocketWithError(ws, 'UPSTREAM_EXHIBIT_FAILED', 'Exhibit information is temporarily unavailable.', {
+      retryable: true
+    }, 1011);
+  }
+
+  const session = {
+    ownerId: claims.sub,
+    exhibitId: exhibit.id,
+    lang,
+    voice,
+    history: [{ role: 'assistant', content: introText }],
+    nextTurnId: 0
+  };
+  const expiresInMs = Math.max(0, claims.exp * 1000 - Date.now());
+  const expiryTimer = setTimeout(() => {
+    closeSocketWithError(ws, 'TICKET_EXPIRED', 'Ticket has expired.');
+  }, expiresInMs);
+
+  ws.on('close', () => clearTimeout(expiryTimer));
+  ws.on('error', (error) => console.error('[app-server] websocket error', error.message));
+  attachChatHandler(ws, session);
+  sendSocketFrame(ws, {
+    type: 'session_ready',
+    exhibit_id: session.exhibitId,
+    lang: session.lang
+  });
+}
+
+function attachChatHandler(ws, session) {
+  let turnChain = Promise.resolve();
+
+  ws.on('message', (raw, isBinary) => {
+    turnChain = turnChain
+      .then(() => handleChatFrame(ws, session, raw, isBinary))
+      .catch((error) => {
+        console.error('[app-server] unexpected chat error', error);
+        sendSocketError(ws, 'INTERNAL_ERROR', 'An unexpected error occurred.');
+      });
+  });
+}
+
+async function handleChatFrame(ws, session, raw, isBinary) {
+  if (isBinary) return sendSocketError(ws, 'INVALID_FRAME', 'Frames must be JSON text.');
+
+  let frame;
+  try {
+    frame = JSON.parse(raw.toString());
+  } catch {
+    return sendSocketError(ws, 'INVALID_FRAME', 'Frames must be JSON.');
+  }
+
+  if (frame.type !== 'user_message' || typeof frame.text !== 'string' || !frame.text.trim()) {
+    return sendSocketError(ws, 'INVALID_FRAME', 'Expected { type: "user_message", text }.');
+  }
+
+  const text = frame.text.trim();
+  const turnId = ++session.nextTurnId;
+  const nextHistory = [...session.history, { role: 'user', content: text }];
+
+  try {
+    const answer = await upstream.llmAnswer({
+      exhibitId: session.exhibitId,
+      lang: session.lang,
+      messages: nextHistory
+    });
+    const wav = await upstream.ttsWav({ text: answer, lang: session.lang, voice: session.voice });
+
+    session.history = [...nextHistory, { role: 'assistant', content: answer }];
+    sendSocketFrame(ws, {
+      type: 'agent_message',
+      turn_id: turnId,
+      text: answer,
+      audio_b64: wav.toString('base64')
+    });
+  } catch (error) {
+    if (error instanceof UpstreamError) {
+      return sendSocketError(ws, error.code, error.message, {
+        retryable: error.retryable,
+        turnId
+      });
+    }
+    throw error;
+  }
+}
+
+function rejectUpgrade(socket, statusCode, statusText) {
+  socket.write(
+    `HTTP/1.1 ${statusCode} ${statusText}\r\n` +
+    'Connection: close\r\n' +
+    'Content-Length: 0\r\n\r\n'
+  );
+  socket.destroy();
+}
+
 async function handleRequest(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || `localhost:${PORT}`}`);
 
@@ -177,15 +326,35 @@ const server = http.createServer((req, res) => {
   });
 });
 
-class GreetingRequestError extends Error {
-  constructor(status, code, message, details) {
-    super(message);
-    this.name = 'GreetingRequestError';
-    this.status = status;
-    this.code = code;
-    this.details = details;
+const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
+
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url, `http://${req.headers.host || `localhost:${PORT}`}`);
+  if (url.pathname !== '/ws/v2') return rejectUpgrade(socket, 404, 'Not Found');
+
+  if (req.headers.origin && req.headers.origin !== ALLOWED_ORIGIN) {
+    return rejectUpgrade(socket, 403, 'Forbidden');
   }
-}
+
+  const ticket = url.searchParams.get('ticket');
+  const ticketResult = verifyTicket(ticket, { secret: TICKET_SECRET });
+  if (!ticketResult.ok) return rejectUpgrade(socket, 401, 'Unauthorized');
+
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit('connection', ws, {
+      claims: ticketResult.claims,
+      exhibitId: url.searchParams.get('exhibit_id'),
+      lang: url.searchParams.get('lang')
+    });
+  });
+});
+
+wss.on('connection', (ws, sessionRequest) => {
+  initializeRealtimeSession(ws, sessionRequest).catch((error) => {
+    console.error('[app-server] session initialization error', error);
+    closeSocketWithError(ws, 'INTERNAL_ERROR', 'An unexpected error occurred.', {}, 1011);
+  });
+});
 
 server.listen(PORT, () => {
   console.log(`[app-server] v2 runtime skeleton listening on :${PORT} (upstream: ${UPSTREAM_URL})`);
