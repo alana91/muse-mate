@@ -2,6 +2,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { getBearerToken, issueTicket, verifyTicket } = require('./auth');
+const { GreetingCache, greetingCacheKey } = require('./greeting-cache');
 const { createUpstreamClient, UpstreamError } = require('./upstream');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -9,6 +10,8 @@ const UPSTREAM_URL = process.env.UPSTREAM_URL || 'http://localhost:9000';
 const UPSTREAM_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 10000);
 const TICKET_SECRET = process.env.TICKET_SECRET;
 const TICKET_TTL_SECONDS = Number(process.env.TICKET_TTL_SECONDS || 1800);
+const GREETING_CACHE_TTL_SECONDS = Number(process.env.GREETING_CACHE_TTL_SECONDS || 86400);
+const GREETING_CACHE_MAX_ENTRIES = Number(process.env.GREETING_CACHE_MAX_ENTRIES || 100);
 const indexHtml = fs.readFileSync(path.join(__dirname, 'index.html'));
 
 if (!TICKET_SECRET) throw new Error('TICKET_SECRET is required');
@@ -18,10 +21,20 @@ if (!Number.isInteger(TICKET_TTL_SECONDS) || TICKET_TTL_SECONDS <= 0) {
 if (!Number.isInteger(UPSTREAM_TIMEOUT_MS) || UPSTREAM_TIMEOUT_MS <= 0) {
   throw new Error('UPSTREAM_TIMEOUT_MS must be a positive integer');
 }
+if (!Number.isInteger(GREETING_CACHE_TTL_SECONDS) || GREETING_CACHE_TTL_SECONDS <= 0) {
+  throw new Error('GREETING_CACHE_TTL_SECONDS must be a positive integer');
+}
+if (!Number.isInteger(GREETING_CACHE_MAX_ENTRIES) || GREETING_CACHE_MAX_ENTRIES <= 0) {
+  throw new Error('GREETING_CACHE_MAX_ENTRIES must be a positive integer');
+}
 
 const upstream = createUpstreamClient({
   baseUrl: UPSTREAM_URL,
   timeoutMs: UPSTREAM_TIMEOUT_MS
+});
+const greetingCache = new GreetingCache({
+  ttlMs: GREETING_CACHE_TTL_SECONDS * 1000,
+  maxEntries: GREETING_CACHE_MAX_ENTRIES
 });
 
 function json(res, status, body, headers = {}) {
@@ -65,6 +78,10 @@ async function handleGreeting(req, res, url) {
   if (!exhibitId) return sendError(res, 400, 'EXHIBIT_ID_REQUIRED', 'exhibit_id is required.');
   if (!lang) return sendError(res, 400, 'LANG_REQUIRED', 'lang is required.');
 
+  const cacheKey = greetingCacheKey(exhibitId, lang);
+  const cachedGreeting = greetingCache.get(cacheKey);
+  if (cachedGreeting) return sendGreeting(res, cachedGreeting);
+
   const exhibit = await upstream.getExhibit(exhibitId);
   if (!exhibit) return sendError(res, 404, 'EXHIBIT_NOT_FOUND', 'The exhibit was not found.');
 
@@ -81,8 +98,14 @@ async function handleGreeting(req, res, url) {
   }
 
   const wav = await upstream.ttsWav({ text, lang, voice });
+  const greeting = { exhibitId: exhibit.id, lang, voice, text, wav };
+  greetingCache.set(cacheKey, greeting);
+  return sendGreeting(res, greeting);
+}
+
+function sendGreeting(res, { exhibitId, lang, voice, text, wav }) {
   return json(res, 200, {
-    exhibit_id: exhibit.id,
+    exhibit_id: exhibitId,
     lang,
     voice,
     text,
