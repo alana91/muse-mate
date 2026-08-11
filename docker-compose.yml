@@ -26,6 +26,7 @@ services:
       - PORT=3000
       - UPSTREAM_URL=http://mock-upstream:9000
       - TICKET_SECRET=${TICKET_SECRET:-development-only-secret}
+      - TICKET_TTL_SECONDS=${TICKET_TTL_SECONDS:-1800}
     ports:
       - "3000:3000"
     depends_on:
