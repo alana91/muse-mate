@@ -25,6 +25,7 @@ services:
     environment:
       - PORT=3000
       - UPSTREAM_URL=http://mock-upstream:9000
+      - UPSTREAM_TIMEOUT_MS=${UPSTREAM_TIMEOUT_MS:-10000}
       - TICKET_SECRET=${TICKET_SECRET:-development-only-secret}
       - TICKET_TTL_SECONDS=${TICKET_TTL_SECONDS:-1800}
     ports:
