@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { getBearerToken, issueTicket, verifyTicket } = require('./auth');
 const { GreetingCache, greetingCacheKey } = require('./greeting-cache');
+const { SingleFlight } = require('./single-flight');
 const { createUpstreamClient, UpstreamError } = require('./upstream');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -36,6 +37,7 @@ const greetingCache = new GreetingCache({
   ttlMs: GREETING_CACHE_TTL_SECONDS * 1000,
   maxEntries: GREETING_CACHE_MAX_ENTRIES
 });
+const greetingFlights = new SingleFlight();
 
 function json(res, status, body, headers = {}) {
   const payload = Buffer.from(JSON.stringify(body));
@@ -82,13 +84,25 @@ async function handleGreeting(req, res, url) {
   const cachedGreeting = greetingCache.get(cacheKey);
   if (cachedGreeting) return sendGreeting(res, cachedGreeting);
 
+  const greeting = await greetingFlights.run(cacheKey, async () => {
+    const cached = greetingCache.get(cacheKey);
+    if (cached) return cached;
+    return generateGreeting(exhibitId, lang, cacheKey);
+  });
+  return sendGreeting(res, greeting);
+}
+
+async function generateGreeting(exhibitId, lang, cacheKey) {
   const exhibit = await upstream.getExhibit(exhibitId);
-  if (!exhibit) return sendError(res, 404, 'EXHIBIT_NOT_FOUND', 'The exhibit was not found.');
+  if (!exhibit) throw new GreetingRequestError(404, 'EXHIBIT_NOT_FOUND', 'The exhibit was not found.');
 
   if (!Array.isArray(exhibit.supported_langs) || !exhibit.supported_langs.includes(lang)) {
-    return sendError(res, 400, 'UNSUPPORTED_LANGUAGE', 'This language is not supported for the exhibit.', {
-      details: { supported_langs: exhibit.supported_langs || [] }
-    });
+    throw new GreetingRequestError(
+      400,
+      'UNSUPPORTED_LANGUAGE',
+      'This language is not supported for the exhibit.',
+      { supported_langs: exhibit.supported_langs || [] }
+    );
   }
 
   const text = exhibit.intro_text?.[lang];
@@ -100,7 +114,7 @@ async function handleGreeting(req, res, url) {
   const wav = await upstream.ttsWav({ text, lang, voice });
   const greeting = { exhibitId: exhibit.id, lang, voice, text, wav };
   greetingCache.set(cacheKey, greeting);
-  return sendGreeting(res, greeting);
+  return greeting;
 }
 
 function sendGreeting(res, { exhibitId, lang, voice, text, wav }) {
@@ -149,6 +163,10 @@ async function handleRequest(req, res) {
 
 const server = http.createServer((req, res) => {
   handleRequest(req, res).catch((error) => {
+    if (error instanceof GreetingRequestError) {
+      return sendError(res, error.status, error.code, error.message, { details: error.details });
+    }
+
     if (error instanceof UpstreamError) {
       return sendError(res, error.status, error.code, error.message, { retryable: error.retryable });
     }
@@ -158,6 +176,16 @@ const server = http.createServer((req, res) => {
     res.destroy();
   });
 });
+
+class GreetingRequestError extends Error {
+  constructor(status, code, message, details) {
+    super(message);
+    this.name = 'GreetingRequestError';
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`[app-server] v2 runtime skeleton listening on :${PORT} (upstream: ${UPSTREAM_URL})`);
