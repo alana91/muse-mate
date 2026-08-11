@@ -1,0 +1,12 @@
+{
+  "name": "musemate-v2-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "MuseMate v2 application server.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
